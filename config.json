@@ -1,0 +1,33 @@
+{
+  "token": "YOUR_DISCORD_BOT_TOKEN",
+  "guild_id": 0,
+  "admin_ids": [
+    123456789012345678
+  ],
+
+  "docker": {
+    "image": "ubuntu:24.04",
+    "network": "bridge",
+    "base_ssh_port": 2200,
+    "container_prefix": "vps"
+  },
+
+  "limits": {
+    "default_ram": "2g",
+    "default_cpu": "2",
+    "default_disk": "20g"
+  },
+
+  "ssh": {
+    "username": "root",
+    "password_length": 16
+  },
+
+  "database": {
+    "file": "database.json"
+  },
+
+  "logging": {
+    "enabled": true
+  }
+}
