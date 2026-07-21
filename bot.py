@@ -7,10 +7,12 @@ Production-ready Discord bot utilizing discord.py 2.5+ to manage local Docker co
 import os
 import sys
 import json
+import time
 import socket
 import string
 import secrets
 import logging
+import traceback
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -48,9 +50,31 @@ class ConfigManager:
 
     def load_config(self) -> None:
         if not os.path.exists(self.filepath):
-            msg = f"Configuration file '{self.filepath}' was not found!"
-            logger.critical(msg)
-            raise FileNotFoundError(msg)
+            logger.warning(f"Configuration file '{self.filepath}' was not found! Generating default template.")
+            default_config = {
+                "token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+                "guild_id": None,
+                "admin_ids": [],
+                "database": {"file": "database.json"},
+                "docker": {
+                    "image": "ubuntu:24.04",
+                    "network": "bridge",
+                    "base_ssh_port": 2200,
+                    "container_prefix": "vps"
+                },
+                "limits": {
+                    "default_ram": "512m",
+                    "default_cpu": 0.5
+                }
+            }
+            try:
+                with open(self.filepath, "w", encoding="utf-8") as f:
+                    json.dump(default_config, f, indent=4)
+                self.config = default_config
+            except Exception as err:
+                logger.error(f"Could not create default config file: {err}")
+                self.config = {}
+            return
 
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
@@ -58,56 +82,99 @@ class ConfigManager:
             logger.info("Configuration file successfully loaded.")
         except json.JSONDecodeError as e:
             logger.critical(f"Config JSON corruption detected: {e}")
-            raise
+            self.config = {}
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.config.get(key, default)
 
     @property
     def token(self) -> str:
-        token_val = self.config.get("bot_token") or self.config.get("token")
-        if not token_val:
-            raise KeyError("Neither 'bot_token' nor 'token' found in config.json")
-        return str(token_val)
+        # Check environment variables first
+        env_token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
+        if env_token and env_token.strip():
+            return env_token.strip()
+
+        # Check config options
+        raw_token = (
+            self.config.get("token") or 
+            self.config.get("bot_token") or 
+            self.config.get("botToken") or
+            self.config.get("DISCORD_TOKEN")
+        )
+        if isinstance(raw_token, str):
+            return raw_token.strip()
+        return ""
 
     @property
     def guild_id(self) -> Optional[int]:
         gid = self.config.get("guild_id")
-        return int(gid) if gid else None
+        try:
+            return int(gid) if gid else None
+        except (ValueError, TypeError):
+            return None
 
     @property
     def admin_ids(self) -> List[int]:
         raw_ids = self.config.get("admin_ids", [])
-        return [int(uid) for uid in raw_ids if str(uid).isdigit()]
+        result = []
+        if isinstance(raw_ids, list):
+            for uid in raw_ids:
+                try:
+                    result.append(int(uid))
+                except (ValueError, TypeError):
+                    pass
+        return result
 
     @property
     def db_file(self) -> str:
-        return str(self.config.get("database_file") or self.config.get("database") or "database.json")
+        db_val = self.config.get("database") or self.config.get("database_file")
+        if isinstance(db_val, dict):
+            path = db_val.get("file") or db_val.get("path") or "database.json"
+            return str(path).strip()
+        if isinstance(db_val, str) and db_val.strip():
+            return db_val.strip()
+        return "database.json"
 
     @property
     def server_ip(self) -> str:
         ssh_cfg = self.config.get("ssh_settings", {})
-        return str(ssh_cfg.get("server_ip", "127.0.0.1"))
+        if isinstance(ssh_cfg, dict) and "server_ip" in ssh_cfg:
+            return str(ssh_cfg["server_ip"])
+        return str(self.config.get("server_ip", "127.0.0.1"))
 
     @property
     def min_port(self) -> int:
         ssh_cfg = self.config.get("ssh_settings", {})
-        return int(ssh_cfg.get("min_port", 20000))
+        if isinstance(ssh_cfg, dict) and "min_port" in ssh_cfg:
+            return int(ssh_cfg["min_port"])
+        docker_cfg = self.config.get("docker", {})
+        if isinstance(docker_cfg, dict) and "base_ssh_port" in docker_cfg:
+            return int(docker_cfg["base_ssh_port"])
+        return int(self.config.get("min_port", 2200))
 
     @property
     def max_port(self) -> int:
         ssh_cfg = self.config.get("ssh_settings", {})
-        return int(ssh_cfg.get("max_port", 30000))
+        if isinstance(ssh_cfg, dict) and "max_port" in ssh_cfg:
+            return int(ssh_cfg["max_port"])
+        return int(self.config.get("max_port", 30000))
 
     @property
     def default_ram(self) -> str:
-        res_cfg = self.config.get("resource_limits", {})
-        return str(res_cfg.get("default_ram", "512m"))
+        limits = self.config.get("limits") or self.config.get("resource_limits")
+        if isinstance(limits, dict) and "default_ram" in limits:
+            return str(limits["default_ram"])
+        return str(self.config.get("default_ram", "512m"))
 
     @property
     def default_cpu(self) -> float:
-        res_cfg = self.config.get("resource_limits", {})
-        return float(res_cfg.get("default_cpu", 0.5))
+        limits = self.config.get("limits") or self.config.get("resource_limits")
+        if isinstance(limits, dict) and "default_cpu" in limits:
+            try:
+                return float(limits["default_cpu"])
+            except ValueError:
+                pass
+        return float(self.config.get("default_cpu", 0.5))
 
 
 # ==========================================
@@ -122,9 +189,12 @@ class DatabaseManager:
 
     def _init_db(self) -> None:
         if not os.path.exists(self.filepath):
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump({"vps_records": {}}, f, indent=4)
-            logger.info(f"Initialized database file at '{self.filepath}'.")
+            try:
+                with open(self.filepath, "w", encoding="utf-8") as f:
+                    json.dump({"vps_records": {}}, f, indent=4)
+                logger.info(f"Initialized database file at '{self.filepath}'.")
+            except Exception as e:
+                logger.error(f"Failed to create database file '{self.filepath}': {e}")
 
     async def _read(self) -> Dict[str, Any]:
         async with self.lock:
@@ -133,17 +203,22 @@ class DatabaseManager:
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    if not isinstance(data, dict):
+                        return {"vps_records": {}}
                     if "vps_records" not in data:
-                        data["vps_records"] = {}
+                        data = {"vps_records": data}
                     return data
             except json.JSONDecodeError:
-                logger.error("Database JSON file is corrupted! Initializing fallback structure.")
+                logger.error("Database JSON file is corrupted! Initializing fallback memory structure.")
                 return {"vps_records": {}}
 
     async def _write(self, data: Dict[str, Any]) -> None:
         async with self.lock:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+            try:
+                with open(self.filepath, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4)
+            except Exception as e:
+                logger.error(f"Failed to write to database file: {e}")
 
     async def get_all_vps(self) -> Dict[str, Any]:
         data = await self._read()
@@ -224,7 +299,6 @@ class DockerManager:
 
             nano_cpus = int(cpu * 1_000_000_000)
 
-            # Execution script to set up SSH daemon cleanly inside standard Ubuntu image
             entrypoint_cmd = (
                 "/bin/bash -c "
                 "\"apt-get update && apt-get install -y openssh-server && "
@@ -297,10 +371,10 @@ class VPSBot(commands.Bot):
         self.docker = dckr
 
     async def setup_hook(self) -> None:
-        logger.info("Performing startup diagnostics...")
+        logger.info("Executing startup command synchronization...")
 
         if not self.docker.is_available():
-            logger.warning("Docker daemon is unreachable. Local VPS functionality will be limited.")
+            logger.warning("Docker daemon is currently unreachable. Container management will be unavailable.")
 
         if self.cfg.guild_id:
             guild = discord.Object(id=self.cfg.guild_id)
@@ -312,7 +386,12 @@ class VPSBot(commands.Bot):
             logger.info("Synchronized slash command tree globally.")
 
     async def on_ready(self) -> None:
-        logger.info(f"Bot logged in as {self.user} (ID: {self.user.id if self.user else 'Unknown'})")
+        logger.info("=" * 50)
+        logger.info("VPS Bot Logged In Successfully!")
+        logger.info(f"Bot User: {self.user} (ID: {self.user.id if self.user else 'Unknown'})")
+        logger.info(f"Connected Guilds: {len(self.guilds)}")
+        logger.info("=" * 50)
+
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
@@ -321,7 +400,7 @@ class VPSBot(commands.Bot):
         )
 
 
-# Instantiate Global Services
+# Instantiate Managers & Bot Client
 config_manager = ConfigManager()
 db_manager = DatabaseManager(config_manager.db_file)
 docker_manager = DockerManager(config_manager)
@@ -329,10 +408,10 @@ bot = VPSBot(config_manager, db_manager, docker_manager)
 
 
 # ==========================================
-# ADMIN HELPER
+# ADMIN & SECURITY HELPERS
 # ==========================================
 def is_admin(interaction: discord.Interaction) -> bool:
-    """Check if the interacting user is listed in admin_ids."""
+    """Check if the user invoking the interaction is in admin_ids."""
     return interaction.user.id in config_manager.admin_ids
 
 
@@ -389,7 +468,7 @@ async def createvps(
                 description=(
                     "Creating a **Real VPS** with a dedicated public IPv4 address requires an external "
                     "virtualization hypervisor (e.g., Proxmox, KVM) or cloud provider API setup.\n\n"
-                    "⚠️ No provider API is configured in `config.json`. The bot will not fabricate fake IP addresses."
+                    "⚠️ No provider API is configured in `config.json`."
                 ),
                 color=discord.Color.orange()
             )
@@ -427,7 +506,7 @@ async def createvps(
 
     all_vps = await db_manager.get_all_vps()
     allocated_ports = [
-        int(rec["ssh_port"]) for rec in all_vps.values() if "ssh_port" in rec
+        int(rec["ssh_port"]) for rec in all_vps.values() if isinstance(rec, dict) and "ssh_port" in rec
     ]
 
     try:
@@ -472,7 +551,7 @@ async def createvps(
             title="🚀 VPS Provisioned Successfully",
             description=f"Container instance `{clean_name}` is active.",
             color=discord.Color.green()
-        )
+     )
         embed.add_field(name="VPS Name", value=clean_name, inline=True)
         embed.add_field(name="Container ID", value=container_id[:12], inline=True)
         embed.add_field(name="RAM Limit", value=allocated_ram, inline=True)
@@ -552,4 +631,271 @@ async def listvps(interaction: discord.Interaction) -> None:
         await interaction.followup.send(embed=embed)
         return
 
-    embed = discord.Em
+    embed = discord.Embed(title="📋 Active VPS Inventory", color=discord.Color.blue())
+
+    for name, data in records.items():
+        if not isinstance(data, dict):
+            continue
+        status = "UNKNOWN"
+        if docker_manager.is_available() and "container_id" in data:
+            status = await docker_manager.get_container_status(data["container_id"])
+
+        details = (
+            f"**Container ID:** `{data.get('container_id', 'N/A')[:12]}`\n"
+            f"**Owner:** <@{data.get('owner_id')}>\n"
+            f"**Limits:** CPU `{data.get('cpu_limit')}` | RAM `{data.get('ram_limit')}`\n"
+            f"**SSH Port:** `{data.get('ssh_port')}`\n"
+            f"**Status:** `{status.upper()}`"
+        )
+        embed.add_field(name=f"🖥️ {name}", value=details, inline=False)
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="startvps", description="Start a stopped VPS instance.")
+@app_commands.describe(name="Name of the VPS to start")
+async def startvps(interaction: discord.Interaction, name: str) -> None:
+    if not is_admin(interaction):
+        await send_access_denied(interaction)
+        return
+
+    await interaction.response.defer()
+    clean_name = name.lower()
+    vps_data = await db_manager.get_vps(clean_name)
+
+    if not vps_data:
+        embed = discord.Embed(title="❌ Error", description="VPS not found.", color=discord.Color.red())
+        await interaction.followup.send(embed=embed)
+        return
+
+    try:
+        await docker_manager.manage_container(vps_data["container_id"], "start")
+        vps_data["status"] = "running"
+        await db_manager.save_vps(clean_name, vps_data)
+        embed = discord.Embed(
+            title="🟩 VPS Started",
+            description=f"VPS `{clean_name}` is now running.",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(title="❌ Action Failed", description=str(e), color=discord.Color.red())
+        await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="stopvps", description="Stop a running VPS instance.")
+@app_commands.describe(name="Name of the VPS to stop")
+async def stopvps(interaction: discord.Interaction, name: str) -> None:
+    if not is_admin(interaction):
+        await send_access_denied(interaction)
+        return
+
+    await interaction.response.defer()
+    clean_name = name.lower()
+    vps_data = await db_manager.get_vps(clean_name)
+
+    if not vps_data:
+        embed = discord.Embed(title="❌ Error", description="VPS not found.", color=discord.Color.red())
+        await interaction.followup.send(embed=embed)
+        return
+
+    try:
+        await docker_manager.manage_container(vps_data["container_id"], "stop")
+        vps_data["status"] = "stopped"
+        await db_manager.save_vps(clean_name, vps_data)
+        embed = discord.Embed(
+            title="🟥 VPS Stopped",
+            description=f"VPS `{clean_name}` has been stopped.",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(title="❌ Action Failed", description=str(e), color=discord.Color.red())
+        await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="restartvps", description="Restart a VPS instance.")
+@app_commands.describe(name="Name of the VPS to restart")
+async def restartvps(interaction: discord.Interaction, name: str) -> None:
+    if not is_admin(interaction):
+        await send_access_denied(interaction)
+        return
+
+    await interaction.response.defer()
+    clean_name = name.lower()
+    vps_data = await db_manager.get_vps(clean_name)
+
+    if not vps_data:
+        embed = discord.Embed(title="❌ Error", description="VPS not found.", color=discord.Color.red())
+        await interaction.followup.send(embed=embed)
+        return
+
+    try:
+        await docker_manager.manage_container(vps_data["container_id"], "restart")
+        vps_data["status"] = "running"
+        await db_manager.save_vps(clean_name, vps_data)
+        embed = discord.Embed(
+            title="🟨 VPS Restarted",
+            description=f"VPS `{clean_name}` has been restarted.",
+            color=discord.Color.green()
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(title="❌ Action Failed", description=str(e), color=discord.Color.red())
+        await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="info", description="View detailed information about a VPS.")
+@app_commands.describe(name="Name of the VPS instance")
+async def info(interaction: discord.Interaction, name: str) -> None:
+    clean_name = name.lower()
+    vps_data = await db_manager.get_vps(clean_name)
+
+    if not vps_data:
+        embed = discord.Embed(
+            title="❌ Not Found",
+            description=f"No VPS named `{clean_name}` was found.",
+            color=discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed)
+        return
+
+    if not is_admin(interaction) and interaction.user.id != vps_data.get("owner_id"):
+        await send_access_denied(interaction)
+        return
+
+    status = "UNKNOWN"
+    if docker_manager.is_available() and "container_id" in vps_data:
+        status = await docker_manager.get_container_status(vps_data["container_id"])
+
+    embed = discord.Embed(title=f"🛠️ Details for VPS: {clean_name}", color=discord.Color.purple())
+    embed.add_field(name="Owner", value=f"<@{vps_data.get('owner_id')}>", inline=True)
+    embed.add_field(name="Status", value=status.upper(), inline=True)
+    embed.add_field(name="Created At", value=str(vps_data.get("creation_time", "N/A")), inline=False)
+    embed.add_field(name="CPU Limit", value=str(vps_data.get("cpu_limit")), inline=True)
+    embed.add_field(name="RAM Limit", value=str(vps_data.get("ram_limit")), inline=True)
+    embed.add_field(name="SSH Port", value=str(vps_data.get("ssh_port")), inline=True)
+    embed.add_field(name="Root Password", value=f"||{vps_data.get('password')}||", inline=False)
+    embed.add_field(
+        name="SSH Command",
+        value=f"```bash\nssh root@{config_manager.server_ip} -p {vps_data.get('ssh_port')}\n```",
+        inline=False
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="stats", description="View host system and Docker engine metrics.")
+async def stats(interaction: discord.Interaction) -> None:
+    await interaction.response.defer()
+
+    if not docker_manager.is_available():
+        embed = discord.Embed(
+            title="❌ System Status",
+            description="Docker Daemon is offline or unreachable.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    try:
+        all_records = await db_manager.get_all_vps()
+        total_tracked = len(all_records)
+
+        containers = await asyncio.to_thread(
+            lambda: docker_manager.client.containers.list(all=True) if docker_manager.client else []
+        )
+        running_cnt = sum(1 for c in containers if c.status == "running")
+
+        embed = discord.Embed(title="📊 Host System & Docker Status", color=discord.Color.gold())
+        embed.add_field(name="Docker Daemon", value="🟢 ONLINE", inline=True)
+        embed.add_field(name="Tracked Database Records", value=str(total_tracked), inline=True)
+        embed.add_field(name="Active Containers", value=str(running_cnt), inline=True)
+        embed.add_field(name="Server IP", value=config_manager.server_ip, inline=True)
+        embed.add_field(
+            name="Port Allocation Range",
+            value=f"{config_manager.min_port} - {config_manager.max_port}",
+            inline=True
+        )
+
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        embed = discord.Embed(
+            title="❌ Error Fetching Metrics",
+            description=str(e),
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="help", description="Display the command manual.")
+async def help_command(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="📖 Discord VPS Manager Manual",
+        description="Manage lightweight local Docker instances via Slash Commands.",
+        color=discord.Color.blue()
+    )
+
+    user_cmds = (
+        "`/listvps` - Show all deployed instances.\n"
+        "`/info <name>` - View server info and login credentials.\n"
+        "`/stats` - Display host Docker daemon status.\n"
+        "`/help` - Show this command list."
+    )
+    embed.add_field(name="👥 General Commands", value=user_cmds, inline=False)
+
+    admin_cmds = (
+        "`/createvps` - Deploy a new VPS instance.\n"
+        "`/deletevps <name>` - Remove a VPS instance and wipe data.\n"
+        "`/startvps <name>` - Start a stopped instance.\n"
+        "`/stopvps <name>` - Stop an active instance.\n"
+        "`/restartvps <name>` - Power cycle an instance."
+    )
+    embed.add_field(name="🛡️ Administrator Commands", value=admin_cmds, inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# ==========================================
+# MAIN APPLICATION ENTRYPOINT
+# ==========================================
+if __name__ == "__main__":
+    token = config_manager.token
+
+    if not token or token == "YOUR_DISCORD_BOT_TOKEN_HERE":
+        logger.critical("=" * 60)
+        logger.critical("ERROR: DISCORD BOT TOKEN IS MISSING OR INVALID IN config.json!")
+        logger.critical("Please open config.json and enter a valid Discord Bot Token.")
+        logger.critical("=" * 60)
+        logger.info("Keeping terminal process active. Press Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            logger.info("Process stopped manually.")
+    else:
+        try:
+            logger.info("Starting Discord Client connection...")
+            bot.run(token)
+        except discord.errors.LoginFailure as err:
+            logger.critical("=" * 60)
+            logger.critical(f"DISCORD LOGIN FAILED: Invalid Token provided! {err}")
+            logger.critical("Please update config.json with a valid token.")
+            logger.critical("=" * 60)
+            logger.info("Keeping process alive for debugging. Press Ctrl+C to stop.")
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                logger.info("Process stopped manually.")
+        except KeyboardInterrupt:
+            logger.info("Bot execution stopped by user (Ctrl+C).")
+        except Exception as err:
+            logger.critical(f"Unhandled runtime error: {err}")
+            logger.critical(traceback.format_exc())
+            logger.info("Keeping process alive. Press Ctrl+C to stop.")
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                logger.info("Process stopped manually.") 
