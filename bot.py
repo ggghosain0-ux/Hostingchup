@@ -89,12 +89,10 @@ class ConfigManager:
 
     @property
     def token(self) -> str:
-        # Check environment variables first
         env_token = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")
         if env_token and env_token.strip():
             return env_token.strip()
 
-        # Check config options
         raw_token = (
             self.config.get("token") or 
             self.config.get("bot_token") or 
@@ -436,8 +434,9 @@ def generate_secure_password(length: int = 16) -> str:
 # SLASH COMMANDS
 # ==========================================
 
-@bot.tree.command(name="createvps", description="Provision and launch a new virtual machine instance.")
+@bot.tree.command(name="createvps", description="Provision and launch a new VPS instance for a user.")
 @app_commands.describe(
+    user="The Discord user who will receive and own this VPS",
     name="Unique name tag for identifying the VPS",
     vps_type="Select between Docker Container or Real Dedicated VPS",
     ram="Memory allocation (e.g. 256m, 512m, 1g)",
@@ -449,6 +448,7 @@ def generate_secure_password(length: int = 16) -> str:
 ])
 async def createvps(
     interaction: discord.Interaction,
+    user: discord.User,
     name: str,
     vps_type: str = "docker",
     ram: str | None = None,
@@ -534,7 +534,7 @@ async def createvps(
         )
 
         vps_record = {
-            "owner_id": interaction.user.id,
+            "owner_id": user.id,
             "vps_name": clean_name,
             "container_id": container_id,
             "creation_time": datetime.now(timezone.utc).isoformat(),
@@ -547,23 +547,60 @@ async def createvps(
 
         await db_manager.save_vps(clean_name, vps_record)
 
-        embed = discord.Embed(
-            title="🚀 VPS Provisioned Successfully",
-            description=f"Container instance `{clean_name}` is active.",
+        # Build Direct Message Embed for Target User
+        dm_embed = discord.Embed(
+            title="🚀 Your VPS Container is Ready!",
+            description=f"An administrator created a new VPS instance for you.",
             color=discord.Color.green()
-     )
-        embed.add_field(name="VPS Name", value=clean_name, inline=True)
-        embed.add_field(name="Container ID", value=container_id[:12], inline=True)
-        embed.add_field(name="RAM Limit", value=allocated_ram, inline=True)
-        embed.add_field(name="CPU Cores", value=str(allocated_cpu), inline=True)
-        embed.add_field(name="SSH Port", value=str(ssh_port), inline=True)
-        embed.add_field(name="Root Password", value=f"||{root_pass}||", inline=False)
-        embed.add_field(
-            name="💻 Connection String",
+        )
+        dm_embed.add_field(name="VPS Name", value=f"`{clean_name}`", inline=True)
+        dm_embed.add_field(name="RAM Limit", value=f"`{allocated_ram}`", inline=True)
+        dm_embed.add_field(name="CPU Cores", value=f"`{allocated_cpu}`", inline=True)
+        dm_embed.add_field(name="SSH Port", value=f"`{ssh_port}`", inline=True)
+        dm_embed.add_field(name="Root Password", value=f"||{root_pass}||", inline=False)
+        dm_embed.add_field(
+            name="💻 SSH Connection Command",
             value=f"```bash\nssh root@{config_manager.server_ip} -p {ssh_port}\n```",
             inline=False
         )
-        await interaction.followup.send(embed=embed)
+        dm_embed.set_footer(text="Keep your credentials secret! Do not share your root password.")
+
+        # Attempt sending DM
+        dm_sent = False
+        try:
+            await user.send(embed=dm_embed)
+            dm_sent = True
+        except discord.Forbidden:
+            logger.warning(f"Failed to DM credentials to user {user.name} ({user.id}) - DMs are closed.")
+        except Exception as dm_err:
+            logger.error(f"Error sending DM to {user.id}: {dm_err}")
+
+        # Channel Confirmation Embed
+        confirm_embed = discord.Embed(
+            title="🚀 VPS Provisioned Successfully",
+            description=f"VPS instance `{clean_name}` was created for <@{user.id}>.",
+            color=discord.Color.green()
+        )
+        confirm_embed.add_field(name="Owner", value=f"<@{user.id}>", inline=True)
+        confirm_embed.add_field(name="VPS Name", value=f"`{clean_name}`", inline=True)
+        confirm_embed.add_field(name="SSH Port", value=f"`{ssh_port}`", inline=True)
+
+        if dm_sent:
+            confirm_embed.add_field(
+                name="📩 Delivery Status",
+                value=f"✅ Full login details & root password were sent to <@{user.id}> via **Direct Message**.",
+                inline=False
+            )
+        else:
+            confirm_embed.add_field(
+                name="⚠️ DM Failed (DMs Closed)",
+                value=f"Could not send a Direct Message to <@{user.id}> because their DMs are turned off.\n\n"
+                      f"**Root Password:** ||{root_pass}||\n"
+                      f"**SSH Command:** `ssh root@{config_manager.server_ip} -p {ssh_port}`",
+                inline=False
+            )
+
+        await interaction.followup.send(embed=confirm_embed)
 
     except Exception as e:
         logger.exception("Failed to create container.")
@@ -845,7 +882,7 @@ async def help_command(interaction: discord.Interaction) -> None:
     embed.add_field(name="👥 General Commands", value=user_cmds, inline=False)
 
     admin_cmds = (
-        "`/createvps` - Deploy a new VPS instance.\n"
+        "`/createvps` - Deploy a new VPS instance for a user.\n"
         "`/deletevps <name>` - Remove a VPS instance and wipe data.\n"
         "`/startvps <name>` - Start a stopped instance.\n"
         "`/stopvps <name>` - Stop an active instance.\n"
@@ -898,4 +935,4 @@ if __name__ == "__main__":
                 while True:
                     time.sleep(3600)
             except KeyboardInterrupt:
-                logger.info("Process stopped manually.") 
+                logger.info("Process stopped manually.")
