@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Discord VPS Manager Bot (tmate.io Integration + Moderation & Utilities)
-Uses local Docker containers as real VPS instances exposed via tmate.io sessions.
+VELTREX VPS Manager Bot
+Uses Docker to provision light Linux environments exposed globally via working tmate.io SSH sessions.
 """
 
 import os
@@ -35,14 +35,14 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger("VPSManagerBot")
+logger = logging.getLogger("VELTREXBot")
 
 
 # ==========================================
 # CONFIGURATION MANAGER
 # ==========================================
 class ConfigManager:
-    """Loads settings from config.json or environment variables."""
+    """Loads configuration settings securely."""
     def __init__(self, filepath: str = "config.json"):
         self.filepath = filepath
         self.config: Dict[str, Any] = {}
@@ -50,15 +50,16 @@ class ConfigManager:
 
     def load_config(self) -> None:
         if not os.path.exists(self.filepath):
-            logger.warning(f"Configuration file '{self.filepath}' missing. Creating default.")
+            logger.warning(f"Configuration file '{self.filepath}' missing. Generating default template.")
             default_config = {
                 "token": "YOUR_DISCORD_BOT_TOKEN_HERE",
                 "guild_id": None,
                 "admin_ids": [],
                 "database": {"file": "database.json"},
                 "limits": {
-                    "default_ram": "512m",
-                    "default_cpu": 0.5
+                    "default_ram": "3g",
+                    "default_cpu": 1.0,
+                    "default_disk": "10G"
                 }
             }
             try:
@@ -66,14 +67,14 @@ class ConfigManager:
                     json.dump(default_config, f, indent=4)
                 self.config = default_config
             except Exception as err:
-                logger.error(f"Could not create default config: {err}")
+                logger.error(f"Could not create default config file: {err}")
                 self.config = {}
             return
 
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 self.config = json.load(f)
-            logger.info("Configuration loaded.")
+            logger.info("Configuration file successfully loaded.")
         except json.JSONDecodeError as e:
             logger.critical(f"Config JSON corrupted: {e}")
             self.config = {}
@@ -116,14 +117,18 @@ class ConfigManager:
 
     @property
     def default_ram(self) -> str:
-        return self.config.get("limits", {}).get("default_ram", "512m")
+        return self.config.get("limits", {}).get("default_ram", "3g")
 
     @property
     def default_cpu(self) -> float:
         try:
-            return float(self.config.get("limits", {}).get("default_cpu", 0.5))
+            return float(self.config.get("limits", {}).get("default_cpu", 1.0))
         except ValueError:
-            return 0.5
+            return 1.0
+
+    @property
+    def default_disk(self) -> str:
+        return self.config.get("limits", {}).get("default_disk", "10G")
 
 
 # ==========================================
@@ -190,19 +195,21 @@ class DatabaseManager:
 # DOCKER & TMATE MANAGER
 # ==========================================
 class DockerManager:
-    """Handles container creation and tmate session extraction."""
+    """Manages Docker engine, base image building, and tmate SSH extraction."""
     def __init__(self, config_mgr: ConfigManager):
         self.config = config_mgr
         self.client: Optional[docker.DockerClient] = None
+        self.custom_image_tag = "veltrex-vps:latest"
         self._connect()
 
     def _connect(self) -> None:
         try:
             self.client = docker.from_env()
             self.client.ping()
-            logger.info("Docker Daemon connected.")
+            logger.info("Docker Daemon connected successfully.")
+            self._ensure_base_image()
         except Exception as e:
-            logger.warning(f"Docker connection failed: {e}")
+            logger.warning(f"Docker connection/setup failed: {e}")
             self.client = None
 
     def is_available(self) -> bool:
@@ -215,33 +222,48 @@ class DockerManager:
         except DockerException:
             return False
 
+    def _ensure_base_image(self) -> None:
+        """Builds a pre-configured Docker image containing tmate so containers launch instantly."""
+        if not self.client:
+            return
+
+        try:
+            self.client.images.get(self.custom_image_tag)
+            logger.info(f"Base VPS image '{self.custom_image_tag}' found.")
+        except NotFound:
+            logger.info(f"Building optimized base image '{self.custom_image_tag}'... Please wait.")
+            dockerfile = (
+                "FROM ubuntu:22.04\n"
+                "ENV DEBIAN_FRONTEND=noninteractive\n"
+                "RUN apt-get update && apt-get install -y tmate openssh-client curl bash ca-certificates && "
+                "apt-get clean && rm -rf /var/lib/apt/lists/*\n"
+            )
+            import io
+            f = io.BytesIO(dockerfile.encode('utf-8'))
+            self.client.images.build(fileobj=f, tag=self.custom_image_tag, rm=True)
+            logger.info(f"Base VPS image '{self.custom_image_tag}' successfully built.")
+
     async def create_tmate_container(self, name: str, ram: str, cpu: float) -> tuple[str, str]:
-        """Creates container, starts tmate, and returns (container_id, tmate_ssh_string)."""
+        """Runs VPS container and captures the active tmate SSH key string."""
         def _sync_create() -> tuple[str, str]:
             if not self.client:
-                raise RuntimeError("Docker client unavailable.")
+                raise RuntimeError("Docker client is unavailable.")
 
-            image_name = "ubuntu:24.04"
-            try:
-                self.client.images.get(image_name)
-            except NotFound:
-                logger.info(f"Pulling image '{image_name}'...")
-                self.client.images.pull(image_name)
-
+            self._ensure_base_image()
             nano_cpus = int(cpu * 1_000_000_000)
 
-            # Boot command: Install tmate, start session, and sleep infinity
-            startup_script = (
-                "apt-get update && apt-get install -y tmate curl openssh-client && "
-                "tmate -F -s /tmp/tmate.sock new-session -d && "
+            # Boot sequence: Initialize tmate session and wait for socket readiness
+            startup_cmd = (
+                "/bin/bash -c "
+                "\"tmate -F -s /tmp/tmate.sock new-session -d && "
                 "tmate -s /tmp/tmate.sock wait tmate-ready && "
                 "tmate -s /tmp/tmate.sock display -p '#{tmate_ssh}' > /tmp/tmate_ssh.txt && "
-                "sleep infinity"
+                "tail -f /dev/null\""
             )
 
             container = self.client.containers.run(
-                image=image_name,
-                command=f"/bin/bash -c \"{startup_script}\"",
+                image=self.custom_image_tag,
+                command=startup_cmd,
                 name=f"vps_{name}",
                 detach=True,
                 mem_limit=ram,
@@ -249,9 +271,9 @@ class DockerManager:
                 restart_policy={"Name": "unless-stopped"}
             )
 
-            # Wait for tmate session to register and print SSH key string
+            # Extract the generated tmate session SSH key string
             tmate_ssh = ""
-            for _ in range(30):
+            for _ in range(25):
                 time.sleep(1)
                 try:
                     exec_res = container.exec_run("cat /tmp/tmate_ssh.txt")
@@ -264,7 +286,8 @@ class DockerManager:
                     pass
 
             if not tmate_ssh:
-                tmate_ssh = "tmate session startup timed out. Run 'tmate -s /tmp/tmate.sock display -p \"#{tmate_ssh}\"' inside container."
+                container.remove(force=True)
+                raise RuntimeError("Failed to obtain a valid tmate SSH connection string from tmate.io servers.")
 
             return str(container.id), tmate_ssh
 
@@ -285,7 +308,7 @@ class DockerManager:
                 elif action == "delete":
                     container.remove(force=True)
             except NotFound:
-                raise ValueError("Container not found.")
+                raise ValueError("Target container was not found on Docker engine.")
             except APIError as e:
                 raise RuntimeError(f"Docker API Error: {e}")
 
@@ -320,30 +343,30 @@ class VPSBot(commands.Bot):
         self.docker = dckr
 
     async def setup_hook(self) -> None:
-        logger.info("Synchronizing commands...")
+        logger.info("Synchronizing Slash Commands...")
         if self.cfg.guild_id:
             guild = discord.Object(id=self.cfg.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info(f"Commands synced to guild: {guild.id}")
+            logger.info(f"Commands synced to target Guild ID: {guild.id}")
         else:
             await self.tree.sync()
-            logger.info("Global commands synced.")
+            logger.info("Global Slash Commands synced successfully.")
 
     async def on_ready(self) -> None:
         logger.info("=" * 50)
-        logger.info(f"Bot Active: {self.user} (ID: {self.user.id if self.user else 'Unknown'})")
+        logger.info(f"VELTREX VPS BOT Active: {self.user} (ID: {self.user.id if self.user else 'Unknown'})")
         logger.info("=" * 50)
 
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="VPS Instances & tmate.io"
+                name="VELTREX VPS Instances"
             )
         )
 
     async def on_member_join(self, member: discord.Member) -> None:
-        """Sends welcome message when a new user joins."""
+        """Sends welcome embed when a user joins the server."""
         channel = member.guild.system_channel
         if not channel:
             channel = next((ch for ch in member.guild.text_channels if ch.permissions_for(member.guild.me).send_messages), None)
@@ -351,8 +374,8 @@ class VPSBot(commands.Bot):
         if channel:
             embed = discord.Embed(
                 title=f"👋 Welcome to {member.guild.name}!",
-                description=f"Welcome {member.mention}! Enjoy your stay and type `/help` to see available commands.",
-                color=discord.Color.blue()
+                description=f"Welcome {member.mention}! Use `/help` to see available commands.",
+                color=discord.Color.from_rgb(46, 204, 113)
             )
             embed.set_thumbnail(url=member.display_avatar.url)
             await channel.send(embed=embed)
@@ -374,7 +397,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
 async def send_access_denied(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
         title="🚫 Access Denied",
-        description="You do not have permission to execute this command.",
+        description="You lack administrative permissions to invoke infrastructure commands.",
         color=discord.Color.red()
     )
     if interaction.response.is_done():
@@ -384,22 +407,24 @@ async def send_access_denied(interaction: discord.Interaction) -> None:
 
 
 # ==========================================
-# VPS MANAGEMENT COMMANDS (TMATE ONLY)
+# VPS MANAGEMENT COMMANDS
 # ==========================================
 
 @bot.tree.command(name="createvps", description="Provision a VPS instance with a tmate SSH key for a target user.")
 @app_commands.describe(
-    user="The user who will own this VPS",
-    name="Name of the VPS instance",
-    ram="RAM allocation (e.g., 512m, 1g)",
-    cpu="CPU allocation (e.g., 0.5, 1.0)"
+    user="The user who will receive and own this VPS",
+    name="Unique name tag for identifying the VPS",
+    ram="RAM limit (e.g. 3g, 1g, 512m)",
+    cpu="CPU cores allocation (e.g. 1, 0.5, 2)",
+    disk="Disk size tag (e.g. 10G, 20G)"
 )
 async def createvps(
     interaction: discord.Interaction,
     user: discord.User,
     name: str,
-    ram: str | None = None,
-    cpu: float | None = None
+    ram: str = "3g",
+    cpu: float = 1.0,
+    disk: str = "10G"
 ) -> None:
     if not is_admin(interaction):
         await send_access_denied(interaction)
@@ -410,7 +435,7 @@ async def createvps(
     if not docker_manager.is_available():
         embed = discord.Embed(
             title="❌ Docker Daemon Offline",
-            description="Docker is not running on the host system.",
+            description="Docker service is not running on host system.",
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed)
@@ -418,24 +443,22 @@ async def createvps(
 
     clean_name = "".join(c for c in name if c.isalnum() or c in ('-', '_')).lower()
     if not clean_name:
-        embed = discord.Embed(title="❌ Invalid Name", description="Enter an alphanumeric name.", color=discord.Color.red())
+        embed = discord.Embed(title="❌ Invalid Name", description="Provide an alphanumeric name.", color=discord.Color.red())
         await interaction.followup.send(embed=embed)
         return
 
     existing = await db_manager.get_vps(clean_name)
     if existing:
-        embed = discord.Embed(title="❌ Name Exists", description=f"`{clean_name}` already exists.", color=discord.Color.red())
+        embed = discord.Embed(title="❌ Name Collision", description=f"VPS `{clean_name}` already exists.", color=discord.Color.red())
         await interaction.followup.send(embed=embed)
         return
 
-    allocated_ram = ram if ram else config_manager.default_ram
-    allocated_cpu = cpu if cpu is not None else config_manager.default_cpu
-
     try:
+        # Provision container and get live tmate SSH string
         container_id, tmate_ssh = await docker_manager.create_tmate_container(
             name=clean_name,
-            ram=allocated_ram,
-            cpu=allocated_cpu
+            ram=ram,
+            cpu=cpu
         )
 
         vps_record = {
@@ -443,64 +466,50 @@ async def createvps(
             "vps_name": clean_name,
             "container_id": container_id,
             "creation_time": datetime.now(timezone.utc).isoformat(),
-            "ram_limit": allocated_ram,
-            "cpu_limit": allocated_cpu,
+            "ram_limit": ram,
+            "cpu_limit": cpu,
+            "disk": disk,
             "tmate_ssh": tmate_ssh,
             "status": "running"
         }
-
         await db_manager.save_vps(clean_name, vps_record)
 
-        # User DM Embed
-        dm_embed = discord.Embed(
-            title="🚀 Your VPS Session is Ready!",
-            description="Your instance was provisioned with a **tmate.io** SSH key session.",
-            color=discord.Color.green()
+        # EXACT EMBED MATCHING USER REFERENCE IMAGE
+        vps_embed = discord.Embed(
+            title="VPS Instance Created",
+            color=discord.Color.from_rgb(46, 204, 113)
         )
-        dm_embed.add_field(name="Instance Name", value=f"`{clean_name}`", inline=True)
-        dm_embed.add_field(name="RAM Limit", value=f"`{allocated_ram}`", inline=True)
-        dm_embed.add_field(name="CPU Cores", value=f"`{allocated_cpu}`", inline=True)
-        dm_embed.add_field(
-            name="🔑 tmate SSH Connection Access Key",
-            value=f"```bash\n{tmate_ssh}\n```",
-            inline=False
+        
+        cpu_display = int(cpu) if cpu.is_integer() else cpu
+        vps_embed.description = (
+            f"OS: Ubuntu 22.04\n"
+            f"RAM: {ram} | CPU: {cpu_display} | Disk: {disk}\n"
+            f"```\n{tmate_ssh}\n```"
         )
-        dm_embed.set_footer(text="Connect from any terminal worldwide without port forwarding.")
 
+        now_str = datetime.now().strftime("%m/%d/%Y %I:%M %p")
+        vps_embed.set_footer(text=f"Powered by VELTREX VPS Bot | {now_str}")
+
+        # Send DM to the target user
         dm_sent = False
         try:
-            await user.send(embed=dm_embed)
+            await user.send(embed=vps_embed)
             dm_sent = True
         except discord.Forbidden:
-            logger.warning(f"Failed to DM user {user.id}")
-
-        confirm_embed = discord.Embed(
-            title="🚀 VPS Provisioned",
-            description=f"Created instance `{clean_name}` for <@{user.id}>.",
-            color=discord.Color.green()
-        )
-        confirm_embed.add_field(name="Owner", value=f"<@{user.id}>", inline=True)
-        confirm_embed.add_field(name="Container ID", value=f"`{container_id[:12]}`", inline=True)
+            logger.warning(f"Failed to send DM to user {user.id} - DMs closed.")
 
         if dm_sent:
-            confirm_embed.add_field(
-                name="📩 DM Status",
-                value=f"✅ Access key sent directly to <@{user.id}> via Direct Message.",
-                inline=False
-            )
+            await interaction.followup.send(content=f"✅ VPS `{clean_name}` created and DM'd to <@{user.id}>!")
         else:
-            confirm_embed.add_field(
-                name="⚠️ DM Failed (DMs Closed)",
-                value=f"Could not DM <@{user.id}>.\n**tmate Access Key:**\n```bash\n{tmate_ssh}\n```",
-                inline=False
+            await interaction.followup.send(
+                content=f"⚠️ VPS created for <@{user.id}>, but their DMs were closed. Here are the credentials:",
+                embed=vps_embed
             )
-
-        await interaction.followup.send(embed=confirm_embed)
 
     except Exception as e:
         logger.exception("Deployment failed")
-        embed = discord.Embed(title="❌ Deployment Error", description=str(e), color=discord.Color.red())
-        await interaction.followup.send(embed=embed)
+        err_embed = discord.Embed(title="❌ Deployment Error", description=str(e), color=discord.Color.red())
+        await interaction.followup.send(embed=err_embed)
 
 
 @bot.tree.command(name="deletevps", description="Delete an existing VPS instance.")
@@ -515,20 +524,20 @@ async def deletevps(interaction: discord.Interaction, name: str) -> None:
     vps_data = await db_manager.get_vps(clean_name)
 
     if not vps_data:
-        embed = discord.Embed(title="❌ Not Found", description=f"No VPS named `{clean_name}`.", color=discord.Color.red())
+        embed = discord.Embed(title="❌ Not Found", description=f"No VPS named `{clean_name}` exists.", color=discord.Color.red())
         await interaction.followup.send(embed=embed)
         return
 
     try:
-        if docker_manager.is_available():
+        if docker_manager.is_available() and "container_id" in vps_data:
             await docker_manager.manage_container(vps_data["container_id"], "delete")
-        await db_manager.delete_vps(clean_name)
 
-        embed = discord.Embed(title="🗑️ VPS Deleted", description=f"Removed `{clean_name}`.", color=discord.Color.green())
+        await db_manager.delete_vps(clean_name)
+        embed = discord.Embed(title="🗑️ VPS Deleted", description=f"Successfully destroyed `{clean_name}`.", color=discord.Color.green())
         await interaction.followup.send(embed=embed)
     except Exception as e:
         await db_manager.delete_vps(clean_name)
-        embed = discord.Embed(title="⚠️ Warning", description=f"Removed record, but Docker error: `{e}`", color=discord.Color.orange())
+        embed = discord.Embed(title="⚠️ Partial Deletion", description=f"Removed record, Docker error: `{e}`", color=discord.Color.orange())
         await interaction.followup.send(embed=embed)
 
 
@@ -538,7 +547,7 @@ async def listvps(interaction: discord.Interaction) -> None:
     records = await db_manager.get_all_vps()
 
     if not records:
-        embed = discord.Embed(title="📋 VPS List", description="No instances found.", color=discord.Color.blue())
+        embed = discord.Embed(title="📋 VPS Inventory", description="No active VPS instances found.", color=discord.Color.blue())
         await interaction.followup.send(embed=embed)
         return
 
@@ -549,9 +558,8 @@ async def listvps(interaction: discord.Interaction) -> None:
         status = await docker_manager.get_container_status(data.get("container_id", ""))
         desc = (
             f"**Owner:** <@{data.get('owner_id')}>\n"
-            f"**Container ID:** `{data.get('container_id', '')[:12]}`\n"
             f"**Status:** `{status.upper()}`\n"
-            f"**RAM:** `{data.get('ram_limit')}` | **CPU:** `{data.get('cpu_limit')}`"
+            f"**Specs:** RAM `{data.get('ram_limit')}` | CPU `{data.get('cpu_limit')}` | Disk `{data.get('disk', '10G')}`"
         )
         embed.add_field(name=f"🖥️ {name}", value=desc, inline=False)
 
@@ -565,7 +573,7 @@ async def info(interaction: discord.Interaction, name: str) -> None:
     vps_data = await db_manager.get_vps(clean_name)
 
     if not vps_data:
-        embed = discord.Embed(title="❌ Not Found", description=f"No VPS named `{clean_name}`.", color=discord.Color.red())
+        embed = discord.Embed(title="❌ Not Found", description=f"No VPS named `{clean_name}` was found.", color=discord.Color.red())
         await interaction.response.send_message(embed=embed)
         return
 
@@ -573,96 +581,87 @@ async def info(interaction: discord.Interaction, name: str) -> None:
         await send_access_denied(interaction)
         return
 
-    status = await docker_manager.get_container_status(vps_data.get("container_id", ""))
-
-    embed = discord.Embed(title=f"🛠️ Details: {clean_name}", color=discord.Color.purple())
-    embed.add_field(name="Owner", value=f"<@{vps_data.get('owner_id')}>", inline=True)
-    embed.add_field(name="Status", value=status.upper(), inline=True)
-    embed.add_field(name="CPU / RAM", value=f"{vps_data.get('cpu_limit')} cores / {vps_data.get('ram_limit')}", inline=True)
-    embed.add_field(
-        name="🔑 tmate SSH Access Command",
-        value=f"```bash\n{vps_data.get('tmate_ssh')}\n```",
-        inline=False
+    vps_embed = discord.Embed(
+        title="VPS Instance Created",
+        color=discord.Color.from_rgb(46, 204, 113)
     )
-    await interaction.response.send_message(embed=embed)
+    
+    cpu_val = vps_data.get('cpu_limit', 1.0)
+    cpu_display = int(cpu_val) if isinstance(cpu_val, float) and cpu_val.is_integer() else cpu_val
+
+    vps_embed.description = (
+        f"OS: Ubuntu 22.04\n"
+        f"RAM: {vps_data.get('ram_limit', '3g')} | CPU: {cpu_display} | Disk: {vps_data.get('disk', '10G')}\n"
+        f"```\n{vps_data.get('tmate_ssh')}\n```"
+    )
+
+    now_str = datetime.now().strftime("%m/%d/%Y %I:%M %p")
+    vps_embed.set_footer(text=f"Powered by VELTREX VPS Bot | {now_str}")
+
+    await interaction.response.send_message(embed=vps_embed)
 
 
 # ==========================================
-# MODERATION COMMANDS
+# MODERATION & UTILITY COMMANDS
 # ==========================================
 
 @bot.tree.command(name="kick", description="Kick a member from the server.")
-@app_commands.describe(user="User to kick", reason="Reason for kicking")
+@app_commands.describe(user="User to kick", reason="Reason for kick")
 async def kick(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None) -> None:
     if not interaction.user.guild_permissions.kick_members:
         await send_access_denied(interaction)
         return
-
     try:
         await user.kick(reason=reason)
-        embed = discord.Embed(
-            title="👢 Member Kicked",
-            description=f"Kicked {user.mention}. Reason: {reason or 'No reason provided.'}",
-            color=discord.Color.orange()
-        )
+        embed = discord.Embed(title="👢 Member Kicked", description=f"Kicked {user.mention}. Reason: {reason or 'None'}", color=discord.Color.orange())
         await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await interaction.response.send_message(content=f"Failed to kick user: {e}", ephemeral=True)
+        await interaction.response.send_message(content=f"Error kicking user: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="ban", description="Ban a member from the server.")
-@app_commands.describe(user="User to ban", reason="Reason for banning")
+@app_commands.describe(user="User to ban", reason="Reason for ban")
 async def ban(interaction: discord.Interaction, user: discord.Member, reason: Optional[str] = None) -> None:
     if not interaction.user.guild_permissions.ban_members:
         await send_access_denied(interaction)
         return
-
     try:
         await user.ban(reason=reason)
-        embed = discord.Embed(
-            title="🔨 Member Banned",
-            description=f"Banned {user.mention}. Reason: {reason or 'No reason provided.'}",
-            color=discord.Color.red()
-        )
+        embed = discord.Embed(title="🔨 Member Banned", description=f"Banned {user.mention}. Reason: {reason or 'None'}", color=discord.Color.red())
         await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await interaction.response.send_message(content=f"Failed to ban user: {e}", ephemeral=True)
+        await interaction.response.send_message(content=f"Error banning user: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="purge", description="Bulk delete messages in channel.")
-@app_commands.describe(amount="Number of messages to clear (1-100)")
+@bot.tree.command(name="purge", description="Bulk delete channel messages.")
+@app_commands.describe(amount="Number of messages (1-100)")
 async def purge(interaction: discord.Interaction, amount: int) -> None:
     if not interaction.user.guild_permissions.manage_messages:
         await send_access_denied(interaction)
         return
-
     if amount < 1 or amount > 100:
-        await interaction.response.send_message("Please specify an amount between 1 and 100.", ephemeral=True)
+        await interaction.response.send_message("Please select an amount between 1 and 100.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
     deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(f"🧹 Successfully cleared {len(deleted)} messages.", ephemeral=True)
+    await interaction.followup.send(f"🧹 Successfully deleted {len(deleted)} messages.", ephemeral=True)
 
-
-# ==========================================
-# UTILITY COMMANDS
-# ==========================================
 
 @bot.tree.command(name="ping", description="Check bot latency.")
 async def ping(interaction: discord.Interaction) -> None:
     latency = round(bot.latency * 1000)
-    embed = discord.Embed(title="🏓 Pong!", description=f"Latency: `{latency}ms`", color=discord.Color.green())
+    embed = discord.Embed(title="🏓 Pong!", description=f"Bot Latency: `{latency}ms`", color=discord.Color.green())
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="userinfo", description="Display user information.")
-@app_commands.describe(user="Target user")
+@app_commands.describe(user="Target member")
 async def userinfo(interaction: discord.Interaction, user: Optional[discord.Member] = None) -> None:
     target = user or interaction.user
     embed = discord.Embed(title=f"👤 User Info: {target.name}", color=discord.Color.blue())
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="ID", value=str(target.id), inline=True)
+    embed.add_field(name="User ID", value=str(target.id), inline=True)
     embed.add_field(name="Joined Server", value=target.joined_at.strftime("%Y-%m-%d") if target.joined_at else "N/A", inline=True)
     embed.add_field(name="Account Created", value=target.created_at.strftime("%Y-%m-%d"), inline=True)
     await interaction.response.send_message(embed=embed)
@@ -672,7 +671,7 @@ async def userinfo(interaction: discord.Interaction, user: Optional[discord.Memb
 async def serverinfo(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if not guild:
-        await interaction.response.send_message("Command must be run in a guild.", ephemeral=True)
+        await interaction.response.send_message("Run this command inside a server.", ephemeral=True)
         return
 
     embed = discord.Embed(title=f"🏰 Server Info: {guild.name}", color=discord.Color.gold())
@@ -681,37 +680,36 @@ async def serverinfo(interaction: discord.Interaction) -> None:
     embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
     embed.add_field(name="Members", value=str(guild.member_count), inline=True)
     embed.add_field(name="Text Channels", value=str(len(guild.text_channels)), inline=True)
-    embed.add_field(name="Created At", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="help", description="Show available commands.")
+@bot.tree.command(name="help", description="Show command list.")
 async def help_command(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
-        title="📖 Discord VPS Bot Manual",
+        title="📖 VELTREX VPS Bot Manual",
         description="All commands use Discord Slash Commands (`/`).",
         color=discord.Color.blue()
     )
     embed.add_field(
         name="🖥️ VPS Commands",
-        value="`/createvps` - Deploy VPS container and DM tmate SSH key\n"
-              "`/deletevps` - Destroy a VPS instance\n"
-              "`/listvps` - View active instances\n"
-              "`/info` - Get VPS specs and tmate connection link",
+        value="`/createvps` - Provision VPS & DM tmate SSH key\n"
+              "`/deletevps` - Delete VPS instance\n"
+              "`/listvps` - List active VPS containers\n"
+              "`/info` - View VPS connection details",
         inline=False
     )
     embed.add_field(
         name="🛠️ Utilities",
-        value="`/ping` - Latency check\n"
-              "`/userinfo` - Get user details\n"
+        value="`/ping` - Check latency\n"
+              "`/userinfo` - User details\n"
               "`/serverinfo` - Guild stats",
         inline=False
     )
     embed.add_field(
         name="🛡️ Moderation",
-        value="`/kick` - Kick a member\n"
-              "`/ban` - Ban a member\n"
-              "`/purge` - Clear bulk channel messages",
+        value="`/kick` - Kick member\n"
+              "`/ban` - Ban member\n"
+              "`/purge` - Clear channel messages",
         inline=False
     )
     await interaction.response.send_message(embed=embed)
@@ -724,7 +722,7 @@ if __name__ == "__main__":
     token = config_manager.token
 
     if not token or token == "YOUR_DISCORD_BOT_TOKEN_HERE":
-        logger.critical("ERROR: BOT TOKEN MISSING IN config.json or environment variables!")
+        logger.critical("ERROR: BOT TOKEN IS MISSING IN config.json!")
         try:
             while True:
                 time.sleep(3600)
@@ -734,9 +732,9 @@ if __name__ == "__main__":
         try:
             bot.run(token)
         except KeyboardInterrupt:
-            logger.info("Bot execution stopped.")
+            logger.info("Bot execution stopped manually.")
         except Exception as err:
-            logger.critical(f"Unhandled error: {err}\n{traceback.format_exc()}")
+            logger.critical(f"Unhandled runtime exception: {err}\n{traceback.format_exc()}")
             try:
                 while True:
                     time.sleep(3600)
