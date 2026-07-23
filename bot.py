@@ -340,8 +340,8 @@ async def createvps(
         await db_manager.save_vps(clean_name, vps_record)
 
         vps_embed = discord.Embed(
-            title="VPS Instance Created",
-            color=discord.Color.from_rgb(46, 204, 113)
+            title="🚀 Your VPS has been successfully deployed!",
+            color=discord.Color.from_rgb(0, 191, 255)
         )
         cpu_display = int(cpu) if cpu.is_integer() else cpu
         vps_embed.description = (
@@ -349,7 +349,7 @@ async def createvps(
             f"RAM: {ram} | CPU: {cpu_display} | Disk: {disk}\n"
             f"```\n{tmate_ssh}\n```"
         )
-        vps_embed.set_footer(text=f"Powered by VELTREX VPS Bot | {datetime.now().strftime('%m/%d/%Y %I:%M %p')}")
+        vps_embed.set_footer(text=f"Powered by SKYDO XD | {datetime.now().strftime('%m/%d/%Y %I:%M %p')}")
 
         try:
             await user.send(embed=vps_embed)
