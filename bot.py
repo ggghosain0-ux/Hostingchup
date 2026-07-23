@@ -195,11 +195,10 @@ class DatabaseManager:
 # DOCKER & TMATE MANAGER
 # ==========================================
 class DockerManager:
-    """Manages Docker engine, base image building, and tmate SSH extraction."""
+    """Manages Docker engine and tmate SSH extraction without building base images."""
     def __init__(self, config_mgr: ConfigManager):
         self.config = config_mgr
         self.client: Optional[docker.DockerClient] = None
-        self.custom_image_tag = "veltrex-vps:latest"
         self._connect()
 
     def _connect(self) -> None:
@@ -207,9 +206,8 @@ class DockerManager:
             self.client = docker.from_env()
             self.client.ping()
             logger.info("Docker Daemon connected successfully.")
-            self._ensure_base_image()
         except Exception as e:
-            logger.warning(f"Docker connection/setup failed: {e}")
+            logger.warning(f"Docker connection failed: {e}")
             self.client = None
 
     def is_available(self) -> bool:
@@ -222,47 +220,34 @@ class DockerManager:
         except DockerException:
             return False
 
-    def _ensure_base_image(self) -> None:
-        """Builds a pre-configured Docker image containing tmate so containers launch instantly."""
-        if not self.client:
-            return
-
-        try:
-            self.client.images.get(self.custom_image_tag)
-            logger.info(f"Base VPS image '{self.custom_image_tag}' found.")
-        except NotFound:
-            logger.info(f"Building optimized base image '{self.custom_image_tag}'... Please wait.")
-            dockerfile = (
-                "FROM ubuntu:22.04\n"
-                "ENV DEBIAN_FRONTEND=noninteractive\n"
-                "RUN apt-get update && apt-get install -y tmate openssh-client curl bash ca-certificates && "
-                "apt-get clean && rm -rf /var/lib/apt/lists/*\n"
-            )
-            import io
-            f = io.BytesIO(dockerfile.encode('utf-8'))
-            self.client.images.build(fileobj=f, tag=self.custom_image_tag, rm=True)
-            logger.info(f"Base VPS image '{self.custom_image_tag}' successfully built.")
-
     async def create_tmate_container(self, name: str, ram: str, cpu: float) -> tuple[str, str]:
-        """Runs VPS container and captures the active tmate SSH key string."""
+        """Runs VPS container, installs tmate directly, and captures SSH key."""
         def _sync_create() -> tuple[str, str]:
             if not self.client:
                 raise RuntimeError("Docker client is unavailable.")
 
-            self._ensure_base_image()
+            image_name = "ubuntu:22.04"
+            try:
+                self.client.images.get(image_name)
+            except NotFound:
+                logger.info(f"Pulling base image '{image_name}'...")
+                self.client.images.pull(image_name)
+
             nano_cpus = int(cpu * 1_000_000_000)
 
-            # Boot sequence: Initialize tmate session and wait for socket readiness
+            # Boot sequence: install required tools, spin up tmate session, write ssh command to file
             startup_cmd = (
                 "/bin/bash -c "
-                "\"tmate -F -s /tmp/tmate.sock new-session -d && "
+                "\"DEBIAN_FRONTEND=noninteractive apt-get update -y > /dev/null 2>&1 && "
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y tmate openssh-client curl > /dev/null 2>&1 && "
+                "tmate -F -s /tmp/tmate.sock new-session -d && "
                 "tmate -s /tmp/tmate.sock wait tmate-ready && "
                 "tmate -s /tmp/tmate.sock display -p '#{tmate_ssh}' > /tmp/tmate_ssh.txt && "
                 "tail -f /dev/null\""
             )
 
             container = self.client.containers.run(
-                image=self.custom_image_tag,
+                image=image_name,
                 command=startup_cmd,
                 name=f"vps_{name}",
                 detach=True,
@@ -271,9 +256,9 @@ class DockerManager:
                 restart_policy={"Name": "unless-stopped"}
             )
 
-            # Extract the generated tmate session SSH key string
+            # Poll for the generated tmate session SSH key string
             tmate_ssh = ""
-            for _ in range(25):
+            for _ in range(45):
                 time.sleep(1)
                 try:
                     exec_res = container.exec_run("cat /tmp/tmate_ssh.txt")
@@ -287,7 +272,7 @@ class DockerManager:
 
             if not tmate_ssh:
                 container.remove(force=True)
-                raise RuntimeError("Failed to obtain a valid tmate SSH connection string from tmate.io servers.")
+                raise RuntimeError("Failed to obtain a valid tmate SSH connection string from tmate.io.")
 
             return str(container.id), tmate_ssh
 
@@ -348,7 +333,7 @@ class VPSBot(commands.Bot):
             guild = discord.Object(id=self.cfg.guild_id)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info(f"Commands synced to target Guild ID: {guild.id}")
+            logger.info(f"Commands synced to Guild ID: {guild.id}")
         else:
             await self.tree.sync()
             logger.info("Global Slash Commands synced successfully.")
@@ -454,7 +439,7 @@ async def createvps(
         return
 
     try:
-        # Provision container and get live tmate SSH string
+        # Provision container and obtain tmate SSH key
         container_id, tmate_ssh = await docker_manager.create_tmate_container(
             name=clean_name,
             ram=ram,
@@ -488,7 +473,7 @@ async def createvps(
         )
 
         now_str = datetime.now().strftime("%m/%d/%Y %I:%M %p")
-        vps_embed.set_footer(text=f"Powered by VELTREX VPS Bot | {now_str}")
+        vps_embed.set_footer(text=f"Powered by VETLREX VPS Bot | {now_str}")
 
         # Send DM to the target user
         dm_sent = False
@@ -596,7 +581,7 @@ async def info(interaction: discord.Interaction, name: str) -> None:
     )
 
     now_str = datetime.now().strftime("%m/%d/%Y %I:%M %p")
-    vps_embed.set_footer(text=f"Powered by VELTREX VPS Bot | {now_str}")
+    vps_embed.set_footer(text=f"Powered by VETLREX VPS Bot | {now_str}")
 
     await interaction.response.send_message(embed=vps_embed)
 
