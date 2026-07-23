@@ -545,7 +545,7 @@ async def info(interaction: discord.Interaction, name: str) -> None:
 
     if not vps_data:
         embed = discord.Embed(title="❌ Not Found", description=f"No VPS named `{clean_name}` was found.", color=discord.Color.red())
-        aw ait interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed)
         return
 
     if not is_admin(interaction) and interaction.user.id != vps_data.get("owner_id"):
